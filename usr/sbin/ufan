@@ -1,0 +1,77 @@
+#!/bin/sh
+# /usr/bin/ufan - Userspace Fan Control for MT7981 / MT7915
+
+TEMP_OFF=65
+TEMP_FULL=90
+POLL=3
+
+CPU_THERMAL="/sys/class/thermal/thermal_zone0"
+WIFI_HWMON_DIR=$(grep -l "mt7915_phy0" /sys/class/hwmon/hwmon*/name 2>/dev/null | sed 's|/name||')
+
+PWM_FILE=""
+for hwmon in /sys/class/hwmon/hwmon*; do
+    for pwm in "${hwmon}"/pwm[0-9]; do
+        [ -w "$pwm" ] && PWM_FILE="$pwm" && break 2
+    done
+done
+
+if [ -z "$PWM_FILE" ]; then
+    logger -t ufan "ERROR: No writable PWM device found."
+    exit 1
+fi
+PWM_ENABLE="${PWM_FILE}_enable"
+
+emergency_revert() {
+    logger -t ufan "Reverting to kernel thermal control."
+    echo 0 > "$PWM_FILE" 2>/dev/null
+    echo "step_wise" > "${CPU_THERMAL}/policy" 2>/dev/null
+    [ -w "$PWM_ENABLE" ] && echo 2 > "$PWM_ENABLE" 2>/dev/null
+    exit 0
+}
+
+trap emergency_revert EXIT TERM INT QUIT ABRT HUP
+
+logger -t ufan "Taking control of the fan..."
+
+echo "user_space" > "${CPU_THERMAL}/policy" 2>/dev/null
+[ -w "$PWM_ENABLE" ] && echo 1 > "$PWM_ENABLE" 2>/dev/null
+
+logger -t ufan "PWM: $PWM_FILE"
+logger -t ufan "CPU: $CPU_THERMAL"
+logger -t ufan "RF: $WIFI_HWMON_DIR"
+logger -t ufan "Working..."
+
+while true; do
+    RAW_CPU=$(cat "${CPU_THERMAL}/temp" 2>/dev/null)
+    if [ -n "$WIFI_HWMON_DIR" ]; then
+        RAW_WIFI=$(cat "${WIFI_HWMON_DIR}/temp1_input" 2>/dev/null)
+    else
+        RAW_WIFI=0
+    fi
+
+    CPU_TEMP=$(( RAW_CPU / 1000 ))
+    WIFI_TEMP=$(( RAW_WIFI / 1000 ))
+
+    MAX_TEMP=$CPU_TEMP
+    if [ "$WIFI_TEMP" -gt "$MAX_TEMP" ]; then
+        MAX_TEMP=$WIFI_TEMP
+    fi
+
+    if [ "$MAX_TEMP" -le "$TEMP_OFF" ]; then
+        TARGET_PWM=0
+    elif [ "$MAX_TEMP" -ge "$TEMP_FULL" ]; then
+        TARGET_PWM=255
+    else
+        RANGE=$(( TEMP_FULL - TEMP_OFF ))
+        DIFF=$(( MAX_TEMP - TEMP_OFF ))
+        TARGET_PWM=$(( (255 * DIFF * DIFF) / (RANGE * RANGE) ))
+    fi
+
+    if [ "$TARGET_PWM" -gt 0 ] && [ "$TARGET_PWM" -lt 50 ]; then
+        TARGET_PWM=50
+    fi
+
+    echo "$TARGET_PWM" > "$PWM_FILE" 2>/dev/null
+    sleep "$POLL"
+done
+
