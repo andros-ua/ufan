@@ -12,3 +12,11 @@ wget https://github.com/andros-ua/ufan/raw/refs/heads/main/etc/init.d/ufan -O /e
 ```shell
 service ufan enable ; service ufan start
 ```
+
+## Prevent script files from being deleted during system upgrades
+```shell
+echo /usr/sbin/ufan >> /etc/sysupgrade.conf
+```
+```shell
+echo /etc/init.d/ufan >> /etc/sysupgrade.conf
+```
