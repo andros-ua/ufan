@@ -4,13 +4,13 @@ uFan — simple, script-based userspace fan control with multi-sensor thermal aw
 ## Installation
 
 ```shell
-wget https://github.com/andros-ua/ufan/raw/refs/heads/main/usr/sbin/ufan -O /usr/sbin/ufan ; chmod +x /usr/sbin/ufan
+wget https://github.com/andros-ua/ufan/raw/refs/heads/main/usr/sbin/ufan -O /usr/sbin/ufan && chmod +x /usr/sbin/ufan
 ```
 ```shell
-wget https://github.com/andros-ua/ufan/raw/refs/heads/main/etc/init.d/ufan -O /etc/init.d/ufan ; chmod +x /etc/init.d/ufan
+wget https://github.com/andros-ua/ufan/raw/refs/heads/main/etc/init.d/ufan -O /etc/init.d/ufan && chmod +x /etc/init.d/ufan
 ```
 ```shell
-service ufan enable ; service ufan start
+service ufan enable && service ufan start
 ```
 
 ## Prevent script files from being deleted during system upgrades
