@@ -1,5 +1,5 @@
 #!/bin/sh
-# /usr/bin/ufan - Userspace Fan Control for MT7981 / MT7915
+# /usr/sbin/ufan - Userspace Fan Control for MT7981 / MT7915
 
 TEMP_OFF=65
 TEMP_FULL=90
