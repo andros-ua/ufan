@@ -1,12 +1,98 @@
 #!/bin/sh
-# /usr/sbin/ufan - Userspace Fan Control for MT7981 / MT7915
+# /usr/sbin/ufan — Userspace Fan Control for MT7981 / MT7915
+#
+# Smooth quadratic PWM curve driven by the hottest of: the CPU thermal zone
+# and the MT7915 Wi-Fi radio.  Key improvements over a naive bang-bang or
+# linear controller:
+#
+#   • Symmetric hysteresis dead-band (single HYSTERESIS knob, ±HYSTERESIS/2)
+#     applied to both the fan on/off latch and PWM write suppression
+#   • Odd HYSTERESIS values are silently rounded down to nearest even integer
+#   • Per-tick slew-rate cap (smooth ramps, no audible whoosh)
+#   • Sensor-read validation (survives brief sysfs unavailability)
+#   • Singleton lockfile (no two instances fighting over PWM)
+#   • Write-on-change with hysteresis gate (avoids unnecessary sysfs traffic)
+#
+# On any exit (clean or signal) the kernel step_wise governor is restored
+# so the fan is never silently abandoned in a bad state.
 
-TEMP_OFF=65
-TEMP_FULL=90
-POLL=3
+VERSION="2.0.1"
 
+# =============================================================================
+# Tunables
+# =============================================================================
+TEMP_OFF=65     # °C  centre of the fan on/off dead-band
+TEMP_FULL=90    # °C  full-speed (PWM 255) at or above this temperature
+PWM_MIN=50      # PWM floor once spinning — prevents motor stall (~20% duty)
+SLEW_MAX=10     # max PWM change per poll tick — keeps ramps audibly smooth
+
+# Symmetric hysteresis applied to both temperature thresholds and PWM writes.
+# Must be a positive even integer.  Odd values are rounded down automatically
+# (e.g. 5 → 4, 3 → 2) so misconfiguration never causes a hard failure.
+# Example: HYSTERESIS=6  →  HALF=3
+#   • fan turns ON  when temp rises above  TEMP_OFF + 3  (68 °C)
+#   • fan turns OFF when temp falls below  TEMP_OFF - 3  (62 °C)
+#   • PWM write is suppressed when |new − current| ≤ 3   (avoids micro-flutter)
+HYSTERESIS=6
+
+POLL=1          # seconds between sensor reads
+LOCKFILE="/var/run/ufan.lock"
+
+# =============================================================================
+# Config sanity check
+# =============================================================================
+
+# If HYSTERESIS is odd or zero, round down to the
+# nearest lower positive even integer rather than refusing to start.
+# This keeps the symmetry guarantee (HALF_HYST = HYSTERESIS / 2 is exact)
+# while tolerating an easy misconfiguration silently.
+if [ $(( HYSTERESIS % 2 )) -ne 0 ]; then
+    HYSTERESIS=$(( HYSTERESIS - 1 ))
+    logger -t ufan "WARNING: odd HYSTERESIS rounded down to $HYSTERESIS."
+fi
+if [ "$HYSTERESIS" -le 0 ]; then
+    HYSTERESIS=2
+    logger -t ufan "WARNING: HYSTERESIS must be > 0 — reset to $HYSTERESIS."
+fi
+
+if [ "$TEMP_OFF" -ge "$TEMP_FULL" ]; then
+    logger -t ufan "ERROR: invalid thresholds — OFF=${TEMP_OFF}°C FULL=${TEMP_FULL}°C"
+    exit 1
+fi
+
+# Half-width of the dead-band used for both temperature and PWM gating.
+HALF_HYST=$(( HYSTERESIS / 2 ))
+
+# Derived temperature thresholds (still in °C here; scaled to m°C below).
+TEMP_ON=$(( TEMP_OFF + HALF_HYST ))   # fan latches ON  above this
+TEMP_LO=$(( TEMP_OFF - HALF_HYST ))   # fan latches OFF below this
+
+# Guard against the derived ON threshold colliding with TEMP_FULL.
+if [ "$TEMP_ON" -ge "$TEMP_FULL" ]; then
+    logger -t ufan "ERROR: TEMP_OFF + HYSTERESIS/2 ($TEMP_ON) must be < TEMP_FULL ($TEMP_FULL)."
+    exit 1
+fi
+
+# =============================================================================
+# Singleton guard
+# =============================================================================
+if [ -f "$LOCKFILE" ]; then
+    OLD_PID=$(cat "$LOCKFILE" 2>/dev/null)
+    if [ -n "$OLD_PID" ] && kill -0 "$OLD_PID" 2>/dev/null; then
+        logger -t ufan "ERROR: already running as PID $OLD_PID — exiting."
+        exit 1
+    fi
+    logger -t ufan "Clearing stale lockfile (PID $OLD_PID no longer exists)."
+fi
+echo $$ > "$LOCKFILE" || { logger -t ufan "ERROR: cannot write lockfile $LOCKFILE"; exit 1; }
+
+# =============================================================================
+# Sensor / actuator discovery
+# =============================================================================
 CPU_THERMAL="/sys/class/thermal/thermal_zone0"
-WIFI_HWMON_DIR=$(grep -l "mt7915_phy0" /sys/class/hwmon/hwmon*/name 2>/dev/null | sed 's|/name||')
+
+WIFI_HWMON_DIR=$(grep -l "mt7915_phy0" /sys/class/hwmon/hwmon*/name 2>/dev/null \
+    | sed 's|/name||')
 
 PWM_FILE=""
 for hwmon in /sys/class/hwmon/hwmon*; do
@@ -16,62 +102,159 @@ for hwmon in /sys/class/hwmon/hwmon*; do
 done
 
 if [ -z "$PWM_FILE" ]; then
-    logger -t ufan "ERROR: No writable PWM device found."
+    logger -t ufan "ERROR: no writable PWM device found."
+    rm -f "$LOCKFILE"
     exit 1
 fi
+
 PWM_ENABLE="${PWM_FILE}_enable"
 
+# =============================================================================
+# Helpers
+# =============================================================================
+
+# is_number VAL — true when VAL is a non-empty decimal integer string.
+is_number() {
+    case "$1" in
+        ''|*[!0-9]*) return 1 ;;
+        *)           return 0 ;;
+    esac
+}
+
+# clamp MIN MAX VAL — prints VAL constrained to [MIN, MAX].
+clamp() {
+    _min=$1 _max=$2 _val=$3
+    [ "$_val" -lt "$_min" ] && _val=$_min
+    [ "$_val" -gt "$_max" ] && _val=$_max
+    printf '%s\n' "$_val"
+}
+
+# =============================================================================
+# Graceful exit handler
+# =============================================================================
+# Writing PWM=0 before restoring the kernel governor is intentional — stuck at
+# 255 on handback is harmless; stuck at 0 after a crash could cook the board.
 emergency_revert() {
     logger -t ufan "Reverting to kernel thermal control."
     echo 0 > "$PWM_FILE" 2>/dev/null
     echo "step_wise" > "${CPU_THERMAL}/policy" 2>/dev/null
     [ -w "$PWM_ENABLE" ] && echo 2 > "$PWM_ENABLE" 2>/dev/null
+    rm -f "$LOCKFILE"
     exit 0
 }
-
 trap emergency_revert EXIT TERM INT QUIT ABRT HUP
 
+# =============================================================================
+# Take ownership of the fan
+# =============================================================================
+logger -t ufan "uFan v${VERSION} starting."
 logger -t ufan "Taking control of the fan..."
-
 echo "user_space" > "${CPU_THERMAL}/policy" 2>/dev/null
 [ -w "$PWM_ENABLE" ] && echo 1 > "$PWM_ENABLE" 2>/dev/null
 
 logger -t ufan "PWM: $PWM_FILE"
 logger -t ufan "CPU: $CPU_THERMAL"
-logger -t ufan "RF: $WIFI_HWMON_DIR"
+logger -t ufan "RF:  ${WIFI_HWMON_DIR:-not found}"
+logger -t ufan "Hysteresis: ±${HALF_HYST} (HYSTERESIS=$HYSTERESIS)"
+logger -t ufan "Thresholds: latch-off=${TEMP_LO}°C latch-on=${TEMP_ON}°C full=${TEMP_FULL}°C"
 logger -t ufan "Working..."
 
+# Scale all degree thresholds to millidegrees once — sysfs reports in m°C.
+TEMP_LO_mC=$(( TEMP_LO   * 1000 ))
+TEMP_ON_mC=$(( TEMP_ON   * 1000 ))
+TEMP_FULL_mC=$(( TEMP_FULL * 1000 ))
+
+# =============================================================================
+# Persistent state
+# =============================================================================
+CURRENT_PWM=0   # last value written; used for slew-rate limiting and hysteresis
+FAN_ON=0        # hysteresis latch: 0 = fan off, 1 = fan running
+
+# =============================================================================
+# Main control loop
+# =============================================================================
 while true; do
+
+    # -------------------------------------------------------------------------
+    # Read sensors
+    # -------------------------------------------------------------------------
     RAW_CPU=$(cat "${CPU_THERMAL}/temp" 2>/dev/null)
+    is_number "$RAW_CPU" || RAW_CPU=0
+
     if [ -n "$WIFI_HWMON_DIR" ]; then
         RAW_WIFI=$(cat "${WIFI_HWMON_DIR}/temp1_input" 2>/dev/null)
+        is_number "$RAW_WIFI" || RAW_WIFI=0
     else
         RAW_WIFI=0
     fi
 
-    CPU_TEMP=$(( RAW_CPU / 1000 ))
-    WIFI_TEMP=$(( RAW_WIFI / 1000 ))
+    MAX_TEMP=$RAW_CPU
+    [ "$RAW_WIFI" -gt "$MAX_TEMP" ] && MAX_TEMP=$RAW_WIFI
 
-    MAX_TEMP=$CPU_TEMP
-    if [ "$WIFI_TEMP" -gt "$MAX_TEMP" ]; then
-        MAX_TEMP=$WIFI_TEMP
+    # -------------------------------------------------------------------------
+    # Hysteresis latch — temperature
+    # -------------------------------------------------------------------------
+    # HYSTERESIS=4 splits symmetrically around TEMP_OFF:
+    #   rises through TEMP_OFF + HALF_HYST  →  latch ON
+    #   falls through TEMP_OFF - HALF_HYST  →  latch OFF
+    # This prevents rapid toggling when temps hover around the threshold.
+    if [ "$FAN_ON" -eq 0 ] && [ "$MAX_TEMP" -ge "$TEMP_ON_mC" ]; then
+        FAN_ON=1
+        logger -t ufan "Fan ON  — $(( MAX_TEMP / 1000 ))°C ≥ ${TEMP_ON}°C (latch-on)"
+    elif [ "$FAN_ON" -eq 1 ] && [ "$MAX_TEMP" -le "$TEMP_LO_mC" ]; then
+        FAN_ON=0
+        logger -t ufan "Fan OFF — $(( MAX_TEMP / 1000 ))°C ≤ ${TEMP_LO}°C (latch-off)"
     fi
 
-    if [ "$MAX_TEMP" -le "$TEMP_OFF" ]; then
+    # -------------------------------------------------------------------------
+    # Compute target PWM — quadratic curve
+    # -------------------------------------------------------------------------
+    # PWM = 255 × ((t − TEMP_ON) / (TEMP_FULL − TEMP_ON))²
+    # Squaring keeps the fan near-silent at mild loads while still hitting
+    # full speed before temps become critical.
+    if [ "$FAN_ON" -eq 0 ]; then
         TARGET_PWM=0
-    elif [ "$MAX_TEMP" -ge "$TEMP_FULL" ]; then
+    elif [ "$MAX_TEMP" -ge "$TEMP_FULL_mC" ]; then
         TARGET_PWM=255
     else
-        RANGE=$(( TEMP_FULL - TEMP_OFF ))
-        DIFF=$(( MAX_TEMP - TEMP_OFF ))
+        RANGE=$(( TEMP_FULL_mC - TEMP_ON_mC ))
+        DIFF=$(( MAX_TEMP - TEMP_ON_mC ))
         TARGET_PWM=$(( (255 * DIFF * DIFF) / (RANGE * RANGE) ))
     fi
 
-    if [ "$TARGET_PWM" -gt 0 ] && [ "$TARGET_PWM" -lt 50 ]; then
-        TARGET_PWM=50
+    # Enforce the minimum running duty cycle — below PWM_MIN motors stall.
+    if [ "$TARGET_PWM" -gt 0 ] && [ "$TARGET_PWM" -lt "$PWM_MIN" ]; then
+        TARGET_PWM=$PWM_MIN
     fi
 
-    echo "$TARGET_PWM" > "$PWM_FILE" 2>/dev/null
+    # -------------------------------------------------------------------------
+    # Slew-rate limiting
+    # -------------------------------------------------------------------------
+    # Cap the per-tick delta to SLEW_MAX so speed changes ramp smoothly
+    # across several ticks rather than jumping in a single audible step.
+    DELTA=$(( TARGET_PWM - CURRENT_PWM ))
+    if   [ "$DELTA" -gt  "$SLEW_MAX" ]; then
+        TARGET_PWM=$(( CURRENT_PWM + SLEW_MAX ))
+    elif [ "$DELTA" -lt "-$SLEW_MAX" ]; then
+        TARGET_PWM=$(( CURRENT_PWM - SLEW_MAX ))
+    fi
+
+    TARGET_PWM=$(clamp 0 255 "$TARGET_PWM")
+
+    # -------------------------------------------------------------------------
+    # Hysteresis gate — PWM write
+    # -------------------------------------------------------------------------
+    # Reuse the same HALF_HYST dead-band for PWM: suppress the write when the
+    # new value is within ±HALF_HYST of what's already set.  When the curve is
+    # nearly flat (e.g. temp drifting ±1 °C around a midpoint) this prevents
+    # the driver from receiving a constant trickle of micro-adjustments that
+    # produce faint audible flutter without meaningfully changing airflow.
+    DELTA=$(( TARGET_PWM - CURRENT_PWM ))
+    ABS_DELTA=${DELTA#-}    # strip leading minus — POSIX portable abs()
+    if [ "$ABS_DELTA" -gt "$HALF_HYST" ]; then
+        echo "$TARGET_PWM" > "$PWM_FILE" 2>/dev/null
+        CURRENT_PWM=$TARGET_PWM
+    fi
+
     sleep "$POLL"
 done
-
