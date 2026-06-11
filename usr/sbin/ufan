@@ -16,7 +16,7 @@
 # On any exit (clean or signal) the kernel step_wise governor is restored
 # so the fan is never silently abandoned in a bad state.
 
-VERSION="2.0.1"
+VERSION="2.0.2"
 
 # =============================================================================
 # Tunables
@@ -159,6 +159,11 @@ logger -t ufan "Hysteresis: ±${HALF_HYST} (HYSTERESIS=$HYSTERESIS)"
 logger -t ufan "Thresholds: latch-off=${TEMP_LO}°C latch-on=${TEMP_ON}°C full=${TEMP_FULL}°C"
 logger -t ufan "Working..."
 
+# On startup, write 0 to the PWM to ensure the fan is off
+# until we read the sensors and decide what speed it should run at.
+# This prevents a potential scenario where the fan gets stuck.
+echo 0 > "$PWM_FILE" 2>/dev/null
+
 # Scale all degree thresholds to millidegrees once — sysfs reports in m°C.
 TEMP_LO_mC=$(( TEMP_LO   * 1000 ))
 TEMP_ON_mC=$(( TEMP_ON   * 1000 ))
@@ -194,7 +199,7 @@ while true; do
     # -------------------------------------------------------------------------
     # Hysteresis latch — temperature
     # -------------------------------------------------------------------------
-    # HYSTERESIS=4 splits symmetrically around TEMP_OFF:
+    # HYSTERESIS splits symmetrically around TEMP_OFF:
     #   rises through TEMP_OFF + HALF_HYST  →  latch ON
     #   falls through TEMP_OFF - HALF_HYST  →  latch OFF
     # This prevents rapid toggling when temps hover around the threshold.
